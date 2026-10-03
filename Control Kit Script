@@ -1,0 +1,890 @@
+Codex Generated Script for Control Kit
+
+# Review, then paste this complete block into authorized PowerShell.
+# Writes files only. No downloads, desktop operations, settings changes or auto-run.
+& {
+    $ErrorActionPreference = 'Stop'
+    $kitDirectory = Join-Path (Get-Location).Path ('windows-python-control-' + [guid]::NewGuid().ToString('N'))
+    if (Test-Path -LiteralPath $kitDirectory) { throw 'Destination already exists' }
+    [System.IO.Directory]::CreateDirectory($kitDirectory) | Out-Null
+    $kitEncoding = [System.Text.UTF8Encoding]::new($false)
+    function Write-PublicFile([string]$Name, [string]$Content, [string]$ExpectedHash) {
+        $destination = Join-Path $kitDirectory $Name
+        $fileBytes = $kitEncoding.GetBytes($Content.Replace("`r`n", "`n") + "`n")
+        $fileStream = [System.IO.File]::Open($destination, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write)
+        try { $fileStream.Write($fileBytes, 0, $fileBytes.Length) } finally { $fileStream.Dispose() }
+        if ((Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant() -ne $ExpectedHash) {
+            throw ('Content verification failed: ' + $Name)
+        }
+    }
+    Write-PublicFile 'win_control.py' @'
+"""Explicit, one-action Windows desktop CLI. Python stdlib; no server or elevation."""
+import argparse
+import ctypes as C
+from ctypes import wintypes as W
+import datetime as dt
+import getpass
+import json
+import os
+from pathlib import Path
+import struct
+import sys
+import time
+import zlib
+
+VERSION = "0.1.0"
+
+
+class ControlError(Exception):
+    def __init__(self, code, message, **details):
+        super().__init__(message)
+        self.code, self.details = code, details
+
+
+def require(condition, code, message, **details):
+    if not condition:
+        raise ControlError(code, message, **details)
+
+
+def utc():
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def write_json(path, value):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Exclusive creation prevents accidental replacement of existing evidence.
+    with path.open("x", encoding="utf-8", newline="\n") as f:
+        json.dump(value, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+
+
+class MOUSEINPUT(C.Structure):
+    _fields_ = [("dx", W.LONG), ("dy", W.LONG), ("mouseData", W.DWORD),
+                ("dwFlags", W.DWORD), ("time", W.DWORD), ("dwExtraInfo", C.c_size_t)]
+
+
+class KEYBDINPUT(C.Structure):
+    _fields_ = [("wVk", W.WORD), ("wScan", W.WORD), ("dwFlags", W.DWORD),
+                ("time", W.DWORD), ("dwExtraInfo", C.c_size_t)]
+
+
+class HARDWAREINPUT(C.Structure):
+    _fields_ = [("uMsg", W.DWORD), ("wParamL", W.WORD), ("wParamH", W.WORD)]
+
+
+class INPUTUNION(C.Union):
+    _fields_ = [("mi", MOUSEINPUT), ("ki", KEYBDINPUT), ("hi", HARDWAREINPUT)]
+
+
+class INPUT(C.Structure):
+    _anonymous_ = ("value",)
+    _fields_ = [("type", W.DWORD), ("value", INPUTUNION)]
+
+
+class BITMAPINFOHEADER(C.Structure):
+    _fields_ = [("biSize", W.DWORD), ("biWidth", W.LONG), ("biHeight", W.LONG),
+                ("biPlanes", W.WORD), ("biBitCount", W.WORD), ("biCompression", W.DWORD),
+                ("biSizeImage", W.DWORD), ("biXPelsPerMeter", W.LONG),
+                ("biYPelsPerMeter", W.LONG), ("biClrUsed", W.DWORD),
+                ("biClrImportant", W.DWORD)]
+
+
+def png_bgra(width, height, pixels):
+    """Encode a top-down 32-bit GDI bitmap as RGB PNG (GDI alpha is undefined)."""
+    require(len(pixels) == width * height * 4, "invalid_bitmap", "Wrong pixel buffer length")
+    rgb = bytearray(width * height * 3)
+    rgb[0::3], rgb[1::3], rgb[2::3] = pixels[2::4], pixels[1::4], pixels[0::4]
+    raw = b"".join(b"\0" + rgb[y * width * 3:(y + 1) * width * 3] for y in range(height))
+
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b""))
+
+
+KEYS = {"BACKSPACE": 8, "TAB": 9, "ENTER": 13, "RETURN": 13, "SHIFT": 16,
+        "CTRL": 17, "ALT": 18, "ESC": 27, "SPACE": 32, "PAGEUP": 33,
+        "PAGEDOWN": 34, "END": 35, "HOME": 36, "LEFT": 37, "UP": 38,
+        "RIGHT": 39, "DOWN": 40, "INSERT": 45, "DELETE": 46, "WIN": 91,
+        "NUMPAD_ADD": 107, "NUMPAD_SUBTRACT": 109, "NUMPAD_MULTIPLY": 106,
+        "NUMPAD_DIVIDE": 111, **{str(i): 48 + i for i in range(10)},
+        **{chr(i): i for i in range(65, 91)}, **{f"F{i}": 111 + i for i in range(1, 25)}}
+EXTENDED = {33, 34, 35, 36, 37, 38, 39, 40, 45, 46, 91, 111}
+
+
+def keyboard_event(vk=0, scan=0, flags=0):
+    return INPUT(type=1, ki=KEYBDINPUT(vk, scan, flags, 0, 0))
+
+
+def key_events(key):
+    names = key.upper().split("+")
+    require(1 <= len(names) <= 4 and len(names) == len(set(names)), "invalid_key", "Use one key or a chord such as CTRL+A")
+    require(all(k in KEYS for k in names), "invalid_key", "Unknown key name", supported=sorted(KEYS))
+    keys = [KEYS[k] for k in names]
+    return ([keyboard_event(vk=k, flags=int(k in EXTENDED)) for k in keys]
+            + [keyboard_event(vk=k, flags=2 | int(k in EXTENDED)) for k in reversed(keys)])
+
+
+def text_events(text):
+    require(0 < len(text) <= 1000, "invalid_text", "Text must contain 1 to 1000 characters")
+    require(all(ord(ch) >= 32 for ch in text), "invalid_text", "Use key commands for control characters")
+    data = text.encode("utf-16-le", errors="strict")
+    events = []
+    for (unit,) in struct.iter_unpack("<H", data):
+        events.extend([keyboard_event(scan=unit, flags=4), keyboard_event(scan=unit, flags=6)])
+    return events
+
+
+class Desktop:
+    def __init__(self):
+        require(sys.platform == "win32", "windows_required", "Run with a Windows Python interpreter")
+        self.u = C.WinDLL("user32", use_last_error=True)
+        self.g = C.WinDLL("gdi32", use_last_error=True)
+        self.k = C.WinDLL("kernel32", use_last_error=True)
+        self.callback = C.WINFUNCTYPE(W.BOOL, W.HWND, W.LPARAM)
+
+        def bind(lib, name, restype, *args):
+            f = getattr(lib, name)
+            f.restype, f.argtypes = restype, args
+            return f
+
+        bind(self.u, "SetProcessDpiAwarenessContext", W.BOOL, W.HANDLE)(C.c_void_p(-4))
+        bind(self.u, "GetForegroundWindow", W.HWND)
+        bind(self.u, "GetWindowThreadProcessId", W.DWORD, W.HWND, C.POINTER(W.DWORD))
+        bind(self.u, "GetWindowTextLengthW", C.c_int, W.HWND)
+        bind(self.u, "GetWindowTextW", C.c_int, W.HWND, W.LPWSTR, C.c_int)
+        bind(self.u, "GetClassNameW", C.c_int, W.HWND, W.LPWSTR, C.c_int)
+        bind(self.u, "GetWindowRect", W.BOOL, W.HWND, C.POINTER(W.RECT))
+        for name in ("IsWindow", "IsWindowVisible", "IsIconic", "SetForegroundWindow"):
+            bind(self.u, name, W.BOOL, W.HWND)
+        bind(self.u, "EnumWindows", W.BOOL, self.callback, W.LPARAM)
+        bind(self.u, "GetCursorPos", W.BOOL, C.POINTER(W.POINT))
+        bind(self.u, "GetSystemMetrics", C.c_int, C.c_int)
+        bind(self.u, "GetAncestor", W.HWND, W.HWND, W.UINT)
+        bind(self.u, "WindowFromPoint", W.HWND, W.POINT)
+        bind(self.u, "SendInput", W.UINT, W.UINT, C.POINTER(INPUT), C.c_int)
+        bind(self.u, "GetAsyncKeyState", C.c_short, C.c_int)
+        bind(self.u, "OpenInputDesktop", W.HANDLE, W.DWORD, W.BOOL, W.DWORD)
+        bind(self.u, "CloseDesktop", W.BOOL, W.HANDLE)
+        bind(self.u, "GetThreadDesktop", W.HANDLE, W.DWORD)
+        bind(self.u, "GetUserObjectInformationW", W.BOOL, W.HANDLE, C.c_int, W.LPVOID, W.DWORD, C.POINTER(W.DWORD))
+        bind(self.k, "GetCurrentThreadId", W.DWORD)
+        bind(self.k, "ProcessIdToSessionId", W.BOOL, W.DWORD, C.POINTER(W.DWORD))
+        bind(self.u, "GetDC", W.HDC, W.HWND)
+        bind(self.u, "ReleaseDC", C.c_int, W.HWND, W.HDC)
+        bind(self.g, "CreateCompatibleDC", W.HDC, W.HDC)
+        bind(self.g, "CreateCompatibleBitmap", W.HBITMAP, W.HDC, C.c_int, C.c_int)
+        bind(self.g, "SelectObject", W.HANDLE, W.HDC, W.HANDLE)
+        bind(self.g, "DeleteObject", W.BOOL, W.HANDLE)
+        bind(self.g, "DeleteDC", W.BOOL, W.HDC)
+        bind(self.g, "BitBlt", W.BOOL, W.HDC, C.c_int, C.c_int, C.c_int, C.c_int, W.HDC, C.c_int, C.c_int, W.DWORD)
+        bind(self.g, "GetDIBits", C.c_int, W.HDC, W.HBITMAP, W.UINT, W.UINT, W.LPVOID, C.POINTER(BITMAPINFOHEADER), W.UINT)
+        require(C.sizeof(INPUT) == (40 if C.sizeof(C.c_void_p) == 8 else 28), "abi_error", "Incorrect INPUT structure size")
+
+    def check(self, result, operation):
+        require(bool(result), "win32_error", operation + " failed", winerror=C.get_last_error())
+        return result
+
+    def desktop_name(self, handle):
+        buf, needed = C.create_unicode_buffer(256), W.DWORD()
+        self.check(self.u.GetUserObjectInformationW(handle, 2, buf, C.sizeof(buf), C.byref(needed)), "GetUserObjectInformationW")
+        return buf.value
+
+    def desktop_access(self):
+        current = self.desktop_name(self.u.GetThreadDesktop(self.k.GetCurrentThreadId()))
+        C.set_last_error(0)
+        handle = self.u.OpenInputDesktop(0, False, 1)  # DESKTOP_READOBJECTS only.
+        if not handle:
+            return {"current_desktop": current, "input_desktop_accessible": False, "winerror": C.get_last_error()}
+        try:
+            active = self.desktop_name(handle)
+            return {"current_desktop": current, "input_desktop": active,
+                    "input_desktop_accessible": True, "same_desktop_name": current == active}
+        finally:
+            self.u.CloseDesktop(handle)
+
+    def require_desktop(self):
+        access = self.desktop_access()
+        require(access.get("input_desktop_accessible") and access.get("same_desktop_name"),
+                "desktop_unavailable", "Caller is not on the accessible input desktop", access=access)
+        return access
+
+    def rect(self, hwnd):
+        r = W.RECT()
+        self.check(self.u.GetWindowRect(hwnd, C.byref(r)), "GetWindowRect")
+        return [r.left, r.top, r.right, r.bottom]
+
+    def window(self, hwnd):
+        require(self.u.IsWindow(hwnd), "window_gone", "Window no longer exists")
+        pid = W.DWORD()
+        self.check(self.u.GetWindowThreadProcessId(hwnd, C.byref(pid)), "GetWindowThreadProcessId")
+        title = C.create_unicode_buffer(self.u.GetWindowTextLengthW(hwnd) + 1)
+        self.u.GetWindowTextW(hwnd, title, len(title))
+        cls = C.create_unicode_buffer(256)
+        self.u.GetClassNameW(hwnd, cls, len(cls))
+        return {"hwnd": int(hwnd), "pid": pid.value, "title": title.value, "class_name": cls.value,
+                "rect": self.rect(hwnd), "visible": bool(self.u.IsWindowVisible(hwnd)),
+                "minimized": bool(self.u.IsIconic(hwnd)), "foreground": self.u.GetForegroundWindow() == hwnd}
+
+    def windows(self):
+        result = []
+
+        @self.callback
+        def visit(hwnd, _):
+            if self.u.IsWindowVisible(hwnd):
+                try:
+                    w = self.window(hwnd)
+                    if w["title"]:
+                        result.append(w)
+                except ControlError:
+                    pass  # A window can disappear during enumeration.
+            return True
+
+        self.check(self.u.EnumWindows(visit, 0), "EnumWindows")
+        return result
+
+    def cursor(self):
+        point = W.POINT()
+        self.check(self.u.GetCursorPos(C.byref(point)), "GetCursorPos")
+        return [point.x, point.y]
+
+    def screen(self):
+        return [self.u.GetSystemMetrics(i) for i in (76, 77, 78, 79)]
+
+    def status(self):
+        session = W.DWORD()
+        self.check(self.k.ProcessIdToSessionId(os.getpid(), C.byref(session)), "ProcessIdToSessionId")
+        return {"version": VERSION, "python": sys.executable, "user": getpass.getuser(), "pid": os.getpid(),
+                "session_id": session.value, "desktop": self.desktop_access(), "cursor": self.cursor(),
+                "virtual_screen_xywh": self.screen(), "input_structure_bytes": C.sizeof(INPUT),
+                "control_enabled": "No global toggle; each explicit action uses caller permissions",
+                "input_permission_verified": False}
+
+    def target(self, hwnd, pid):
+        self.require_desktop()
+        w = self.window(hwnd)
+        require(w["pid"] == pid, "target_changed", "Window PID no longer matches")
+        require(w["visible"] and not w["minimized"], "window_not_visible", "Target must be visible and not minimized")
+        return w
+
+    def capture(self, rect, path):
+        x, y, right, bottom = rect
+        width, height = right - x, bottom - y
+        sx, sy, sw, sh = self.screen()
+        require(0 < width <= 16000 and 0 < height <= 16000 and width * height <= 40_000_000,
+                "invalid_capture", "Capture dimensions are invalid or too large")
+        require(x >= sx and y >= sy and right <= sx + sw and bottom <= sy + sh,
+                "offscreen", "Target rectangle must fit entirely inside the virtual screen")
+        dc = mem = bitmap = old = None
+        try:
+            dc = self.check(self.u.GetDC(None), "GetDC")
+            mem = self.check(self.g.CreateCompatibleDC(dc), "CreateCompatibleDC")
+            bitmap = self.check(self.g.CreateCompatibleBitmap(dc, width, height), "CreateCompatibleBitmap")
+            old = self.check(self.g.SelectObject(mem, bitmap), "SelectObject")
+            self.check(self.g.BitBlt(mem, 0, 0, width, height, dc, x, y, 0x40CC0020), "BitBlt")
+            self.g.SelectObject(mem, old)
+            old = None
+            info = BITMAPINFOHEADER(C.sizeof(BITMAPINFOHEADER), width, -height, 1, 32, 0, 0, 0, 0, 0, 0)
+            buf = C.create_string_buffer(width * height * 4)
+            lines = self.g.GetDIBits(dc, bitmap, 0, height, buf, C.byref(info), 0)
+            require(lines == height, "capture_failed", "GetDIBits returned incomplete pixels", lines=lines, winerror=C.get_last_error())
+            with Path(path).open("xb") as f:
+                f.write(png_bgra(width, height, buf.raw))
+        finally:
+            if old and mem:
+                self.g.SelectObject(mem, old)
+            if bitmap:
+                self.g.DeleteObject(bitmap)
+            if mem:
+                self.g.DeleteDC(mem)
+            if dc:
+                self.u.ReleaseDC(None, dc)
+
+    @staticmethod
+    def output_paths(out):
+        base = Path(out).resolve()
+        png, receipt = Path(str(base) + ".png"), Path(str(base) + ".json")
+        require(not png.exists() and not receipt.exists(), "output_exists", "Choose a new output prefix")
+        base.parent.mkdir(parents=True, exist_ok=True)
+        return png, receipt
+
+    def observe(self, hwnd, pid, out):
+        png, receipt = self.output_paths(out)
+        w = self.target(hwnd, pid)
+        self.capture(w["rect"], png)
+        require(self.window(hwnd) == w, "window_changed", "Window changed during capture; observe again")
+        result = {"version": VERSION, "captured_at": utc(), "captured_epoch": time.time(),
+                  "window": w, "cursor_screen": self.cursor(), "screenshot": str(png),
+                  "observation": str(receipt), "coordinates": "physical pixels relative to screenshot top-left",
+                  "capture_method": "visible desktop crop; overlapping windows can appear"}
+        write_json(receipt, result)
+        return result
+
+    def send(self, events):
+        data = (INPUT * len(events))(*events)
+        C.set_last_error(0)
+        inserted = self.u.SendInput(len(data), data, C.sizeof(INPUT))
+        require(inserted == len(data), "input_rejected", "SendInput did not insert all events; do not automatically retry",
+                requested=len(data), inserted=inserted, winerror=C.get_last_error(),
+                note="UIPI may block input without a distinguishing error; insertion is not app acceptance")
+        return inserted
+
+    def act(self, args):
+        # Validate all outputs/parameters before sending any input.
+        self.output_paths(args.out)
+        previous = json.loads(Path(args.observation).read_text(encoding="utf-8"))
+        age = time.time() - previous["captured_epoch"]
+        require(0 <= age <= 120, "stale_observation", "Observe and inspect again; observation must be within 120 seconds", age_seconds=age)
+        old = previous["window"]
+        w = self.target(old["hwnd"], old["pid"])
+        for field in ("title", "class_name", "rect"):
+            require(w[field] == old[field], "target_changed", "Target changed since observation", field=field)
+        hwnd = w["hwnd"]
+        if args.kind == "activate":
+            self.check(self.u.SetForegroundWindow(hwnd), "SetForegroundWindow")
+            time.sleep(0.15)
+            require(self.u.GetForegroundWindow() == hwnd, "focus_denied", "Windows did not grant foreground focus")
+            return {"action": "activate", "after": self.observe(hwnd, w["pid"], args.out)}
+        # An ordinary click can select a visible background window. Keyboard and
+        # wheel input require verified focus; never force focus with thread attachment.
+        if args.kind not in ("move", "click"):
+            require(self.u.GetForegroundWindow() == hwnd, "not_foreground", "Target is not foreground; select it and inspect")
+        held = [k for k in (1, 2, 4, 16, 17, 18, 91, 92) if self.u.GetAsyncKeyState(k) & 0x8000]
+        require(not held, "physical_input_active", "A mouse button or modifier is held; no input sent", virtual_keys=held)
+        if args.kind in ("move", "click", "scroll"):
+            require(args.x is not None and args.y is not None, "coordinates_required", "x and y are required screenshot coordinates")
+            x, y, right, bottom = w["rect"]
+            require(0 <= args.x < right - x and 0 <= args.y < bottom - y, "out_of_bounds", "Coordinates are outside target")
+            px, py = x + args.x, y + args.y
+            hit = self.u.WindowFromPoint(W.POINT(px, py))
+            require(self.u.GetAncestor(hit, 2) == hwnd, "target_occluded", "Another window covers the requested point")
+            sx, sy, sw, sh = self.screen()
+            move = INPUT(type=0, mi=MOUSEINPUT(round((px-sx)*65535/(sw-1)), round((py-sy)*65535/(sh-1)), 0, 0xC001, 0, 0))
+            events = [move]
+            if args.kind == "click":
+                down, up = {"left": (2, 4), "right": (8, 16), "middle": (32, 64)}[args.button]
+                events += [INPUT(type=0, mi=MOUSEINPUT(0, 0, 0, flag, 0, 0)) for flag in (down, up)]
+            if args.kind == "scroll":
+                require(args.delta is not None and args.delta != 0 and abs(args.delta) <= 1200,
+                        "invalid_scroll", "delta must be nonzero and at most 1200; one notch is 120")
+                events.append(INPUT(type=0, mi=MOUSEINPUT(0, 0, args.delta & 0xFFFFFFFF, 0x0800, 0, 0)))
+        elif args.kind == "key":
+            require(bool(args.key), "key_required", "--key is required")
+            events = key_events(args.key)
+        else:
+            require(bool(args.text_file), "text_required", "--text-file UTF-8 path is required")
+            events = text_events(Path(args.text_file).read_text(encoding="utf-8"))
+        if args.kind not in ("move", "click"):
+            require(self.u.GetForegroundWindow() == hwnd, "focus_changed", "Foreground changed before input")
+        count = self.send(events)
+        time.sleep(0.18)
+        try:
+            after = self.observe(hwnd, w["pid"], args.out)
+        except (ControlError, OSError) as exc:
+            # An action might legitimately close/move its window. Never imply it did not execute.
+            return {"action": args.kind, "events_inserted": count, "application_acceptance": "requires verification",
+                    "post_observation_failed": str(exc), "do_not_repeat_automatically": True}
+        return {"action": args.kind, "events_inserted": count,
+                "application_acceptance": "inspect after screenshot", "after": after}
+
+
+def main(argv=None):
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="strict")
+    p = argparse.ArgumentParser(description=__doc__)
+    sub = p.add_subparsers(dest="command", required=True)
+    sub.add_parser("status")
+    sub.add_parser("windows")
+    obs = sub.add_parser("observe")
+    obs.add_argument("--hwnd", type=int, required=True)
+    obs.add_argument("--pid", type=int, required=True)
+    obs.add_argument("--out", required=True)
+    act = sub.add_parser("act")
+    act.add_argument("--observation", required=True)
+    act.add_argument("--kind", choices=("activate", "move", "click", "scroll", "key", "text"), required=True)
+    act.add_argument("--out", required=True)
+    act.add_argument("--x", type=int)
+    act.add_argument("--y", type=int)
+    act.add_argument("--button", choices=("left", "right", "middle"), default="left")
+    act.add_argument("--delta", type=int)
+    act.add_argument("--key")
+    act.add_argument("--text-file")
+    args = p.parse_args(argv)
+    try:
+        desktop = Desktop()
+        if args.command == "status":
+            result = desktop.status()
+        elif args.command == "windows":
+            result = {"windows": desktop.windows()}
+        elif args.command == "observe":
+            result = desktop.observe(args.hwnd, args.pid, args.out)
+        else:
+            result = desktop.act(args)
+        print(json.dumps({"ok": True, "time": utc(), "result": result}, ensure_ascii=False))
+        return 0
+    except (ControlError, OSError, ValueError, KeyError) as exc:
+        print(json.dumps({"ok": False, "time": utc(), "error": {"code": getattr(exc, "code", type(exc).__name__),
+              "message": str(exc), "details": getattr(exc, "details", {})}}, ensure_ascii=False))
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+'@ '419475dba659cd718ed0abc9958e964998d7005f7b77f295c5cadbcc05013cf8'
+    Write-PublicFile 'test_window.py' @'
+"""Disposable Tk window; writes only its own state and exits after ten minutes."""
+import argparse
+import json
+import os
+from pathlib import Path
+import time
+import tkinter as tk
+from win_control import Desktop
+
+p = argparse.ArgumentParser()
+p.add_argument("--out", required=True)
+args = p.parse_args()
+folder = Path(args.out).resolve()
+folder.mkdir(parents=True, exist_ok=True)
+if (folder / "fixture.json").exists():
+    raise SystemExit("Choose a new fixture directory")
+d = Desktop()
+root = tk.Tk()
+root.title(f"Python Control Test - {os.getpid()}")
+root.geometry("600x330+80+100")
+root.configure(bg="#eff6ff")
+state = {"pid": os.getpid(), "clicks": 0, "wheel_total": 0, "motions": 0, "text": "", "closed": False}
+tk.Label(root, text="Disposable Python control test", font=("Segoe UI", 17), bg="#eff6ff").pack(pady=12)
+tk.Label(root, text="Only this window is used for the diagnostic.", bg="#eff6ff").pack()
+text = tk.StringVar()
+entry = tk.Entry(root, textvariable=text, font=("Segoe UI", 16), width=34)
+entry.pack(pady=18)
+counter = tk.StringVar(value="Clicks: 0 | Wheel: 0")
+
+
+def save():
+    state["text"] = text.get()
+    state["updated_epoch"] = time.time()
+    temp = folder / "fixture.tmp"
+    temp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp.replace(folder / "fixture.json")
+
+
+def update():
+    counter.set(f"Clicks: {state['clicks']} | Wheel: {state['wheel_total']}")
+    save()
+
+
+def click():
+    state["clicks"] += 1
+    update()
+
+
+button = tk.Button(root, text="Test click", command=click, font=("Segoe UI", 14), width=20)
+button.pack(pady=6)
+tk.Label(root, textvariable=counter, font=("Segoe UI", 12), bg="#eff6ff").pack(pady=8)
+
+
+def motion(event):
+    state["motions"] += 1
+    state["last_pointer"] = [event.x_root, event.y_root]
+    save()
+
+
+def wheel(event):
+    state["wheel_total"] += event.delta
+    update()
+
+
+def close():
+    state["closed"] = True
+    save()
+    root.destroy()
+
+
+root.bind("<Motion>", motion)
+root.bind("<MouseWheel>", wheel)
+text.trace_add("write", lambda *_: save())
+root.protocol("WM_DELETE_WINDOW", close)
+root.update()
+hwnd = int(d.u.GetAncestor(entry.winfo_id(), 2))
+state["hwnd"] = hwnd
+state["window"] = d.window(hwnd)
+state["entry_screen"] = [entry.winfo_rootx() + entry.winfo_width() // 2, entry.winfo_rooty() + entry.winfo_height() // 2]
+state["button_screen"] = [button.winfo_rootx() + button.winfo_width() // 2, button.winfo_rooty() + button.winfo_height() // 2]
+save()
+root.after(600_000, close)
+root.mainloop()
+'@ '71de9195983f1d26feee36edda08e513d3f467f74e5e805c56d357ad04ff323e'
+    Write-PublicFile 'test_core.py' @'
+"""Protocol/ABI tests with no desktop input."""
+import ctypes as C
+import json
+from pathlib import Path
+import struct
+import subprocess
+import sys
+import tempfile
+import unittest
+import zlib
+import win_control as w
+
+
+class CoreTests(unittest.TestCase):
+    def test_abi(self):
+        self.assertEqual(C.sizeof(w.INPUT), 40 if C.sizeof(C.c_void_p) == 8 else 28)
+        self.assertEqual(C.sizeof(w.BITMAPINFOHEADER), 40)
+
+    def test_unicode_events(self):
+        events = w.text_events("AΩ漢😀")
+        self.assertEqual([e.ki.wScan for e in events[::2]], [65, 937, 28450, 0xD83D, 0xDE00])
+        self.assertTrue(all(e.type == 1 and e.ki.wVk == 0 for e in events))
+        self.assertEqual([e.ki.dwFlags for e in events], [4, 6] * 5)
+
+    def test_reject_control_text_and_bad_keys(self):
+        for text in ("", "x\ny", "\0", "x" * 1001):
+            with self.assertRaises(w.ControlError):
+                w.text_events(text)
+        for key in ("CTRL+CTRL+A", "BOGUS"):
+            with self.assertRaises(w.ControlError):
+                w.key_events(key)
+
+    def test_chord_releases_reverse_order(self):
+        events = w.key_events("CTRL+RIGHT")
+        self.assertEqual([(e.ki.wVk, e.ki.dwFlags) for e in events], [(17, 0), (39, 1), (39, 3), (17, 2)])
+
+    def test_png_colors_rows_and_crc(self):
+        png = w.png_bgra(2, 2, bytes([0, 0, 255, 0, 0, 255, 0, 0, 255, 0, 0, 0, 255, 255, 255, 0]))
+        self.assertEqual(png[:8], b"\x89PNG\r\n\x1a\n")
+        offset, chunks = 8, {}
+        while offset < len(png):
+            size = struct.unpack(">I", png[offset:offset+4])[0]
+            kind, data = png[offset+4:offset+8], png[offset+8:offset+8+size]
+            self.assertEqual(struct.unpack(">I", png[offset+8+size:offset+12+size])[0], zlib.crc32(kind+data))
+            chunks[kind] = data
+            offset += 12 + size
+        self.assertEqual(zlib.decompress(chunks[b"IDAT"]), b"\0\xff\0\0\0\xff\0\0\0\0\xff\xff\xff\xff")
+
+    def test_unicode_receipt_no_overwrite(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "unicode.json"
+            w.write_json(path, {"text": "Ω漢😀"})
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {"text": "Ω漢😀"})
+            with self.assertRaises(FileExistsError):
+                w.write_json(path, {})
+
+    def test_status_protocol(self):
+        r = subprocess.run([sys.executable, str(Path(w.__file__)), "status"], capture_output=True, encoding="utf-8", timeout=8)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        result = json.loads(r.stdout)
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["result"]["input_permission_verified"])
+
+
+if __name__ == "__main__":
+    unittest.main()
+'@ 'e77eb3d7daa047cd0200c5fd4236e6171293b65549523a8f7916daa1296fbbbe'
+    Write-PublicFile 'test_guards.py' @'
+"""No-input regression tests for refusing stale or mismatched UI targets."""
+import argparse
+import json
+from pathlib import Path
+import tempfile
+import time
+import unittest
+from unittest.mock import Mock
+import win_control as w
+
+
+class GuardTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+        self.window = {"hwnd": 11, "pid": 22, "title": "Owned fixture", "class_name": "TkTopLevel",
+                       "rect": [100, 100, 600, 400], "visible": True, "minimized": False, "foreground": True}
+        self.obs = {"window": self.window.copy(), "captured_epoch": time.time()}
+        self.d = w.Desktop.__new__(w.Desktop)
+        self.d.u = Mock()
+        self.d.u.GetForegroundWindow.return_value = 11
+        self.d.u.GetAsyncKeyState.return_value = 0
+        self.d.target = Mock(return_value=self.window)
+        self.d.send = Mock(side_effect=AssertionError("A refused action must not call SendInput"))
+        self.args = argparse.Namespace(out=str(self.base / "after"), observation=str(self.base / "before.json"),
+                 kind="key", key="A", x=None, y=None, button="left", delta=None, text_file=None)
+
+    def refuse(self, code):
+        Path(self.args.observation).write_text(json.dumps(self.obs), encoding="utf-8")
+        with self.assertRaises(w.ControlError) as caught:
+            self.d.act(self.args)
+        self.assertEqual(caught.exception.code, code)
+        self.d.send.assert_not_called()
+
+    def test_stale_receipt(self):
+        self.obs["captured_epoch"] -= 121
+        self.refuse("stale_observation")
+
+    def test_future_receipt(self):
+        self.obs["captured_epoch"] += 30
+        self.refuse("stale_observation")
+
+    def test_window_geometry_changed(self):
+        self.window["rect"] = [101, 100, 601, 400]
+        self.refuse("target_changed")
+
+    def test_title_changed(self):
+        self.window["title"] = "Another document"
+        self.refuse("target_changed")
+
+    def test_keyboard_focus_required(self):
+        self.d.u.GetForegroundWindow.return_value = 99
+        self.refuse("not_foreground")
+
+    def test_held_modifier(self):
+        self.d.u.GetAsyncKeyState.side_effect = lambda vk: 0x8000 if vk == 17 else 0
+        self.refuse("physical_input_active")
+
+    def test_occluded_click(self):
+        self.args.kind, self.args.x, self.args.y = "click", 100, 100
+        self.d.u.WindowFromPoint.return_value = 99
+        self.d.u.GetAncestor.return_value = 99
+        self.refuse("target_occluded")
+
+    def test_outside_window(self):
+        self.args.kind, self.args.x, self.args.y = "move", 500, 10
+        self.refuse("out_of_bounds")
+
+    def test_no_overwrite_before_input(self):
+        Path(self.args.out + ".png").write_bytes(b"prior evidence")
+        self.refuse("output_exists")
+
+    def test_target_pid_changed(self):
+        self.d.require_desktop = Mock()
+        self.d.window = Mock(return_value=self.window)
+        with self.assertRaises(w.ControlError) as caught:
+            w.Desktop.target(self.d, 11, 999)
+        self.assertEqual(caught.exception.code, "target_changed")
+
+
+if __name__ == "__main__":
+    unittest.main()
+'@ '530793b8b3d7470d07c8b67fa0a805c31efe5b32db87abc8c8ef69dd6274517a'
+    Write-PublicFile 'selftest.py' @'
+"""Run existing pure/guard tests without opening or querying the desktop."""
+import ast
+from pathlib import Path
+import sys
+import unittest
+from unittest.mock import patch
+
+
+def main():
+    if sys.platform != "win32":
+        raise SystemExit("Use Windows Python: ctypes Windows ABI sizes differ elsewhere.")
+    root = Path(__file__).resolve().parent
+    sources = sorted(root.glob("*.py"))
+    for source in sources:
+        ast.parse(source.read_text(encoding="utf-8"), filename=source.name)
+    import test_core
+    import test_guards
+    import win_control
+    test_core.CoreTests.test_status_protocol = unittest.skip(
+        "Desktop-query integration test intentionally excluded from this no-desktop run."
+    )(test_core.CoreTests.test_status_protocol)
+    suite = unittest.TestSuite([
+        unittest.defaultTestLoader.loadTestsFromModule(test_core),
+        unittest.defaultTestLoader.loadTestsFromModule(test_guards),
+    ])
+    blocked = AssertionError("No desktop construction or child-process launch in selftest")
+    with patch.object(win_control.Desktop, "__init__", side_effect=blocked), \
+         patch("ctypes.WinDLL", side_effect=blocked), \
+         patch("subprocess.Popen", side_effect=blocked):
+        result = unittest.TextTestRunner(verbosity=2).run(suite)
+    print("Parsed %d Python files; no desktop API session or input was started." % len(sources))
+    return 0 if result.wasSuccessful() and result.testsRun == 17 and len(result.skipped) == 1 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+'@ '5b9ec2a0f5f1916acaf18d36e0ff53c5493e6cd54bf140d31aa20de306278723'
+    Write-PublicFile 'run_control.py' @'
+"""Bound one unchanged harness command; preserve a local receipt, never retry."""
+import datetime
+import json
+from pathlib import Path
+import subprocess
+import sys
+import uuid
+
+
+def main():
+    arguments = sys.argv[1:]
+    if not arguments or arguments[0] not in ("status", "windows", "observe", "act"):
+        raise SystemExit("Usage: python run_control.py status|windows|observe|act [options]")
+    root = Path(__file__).resolve().parent
+    receipts = root / "command-receipts"
+    receipts.mkdir(exist_ok=True)
+    receipt = receipts / (uuid.uuid4().hex + ".json")
+    command = [sys.executable, "-X", "utf8", str(root / "win_control.py"), *arguments]
+    record = {"started_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+              "command": command, "timeout_seconds": 8, "environment_overrides": False}
+    try:
+        result = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, timeout=8,
+                                creationflags=subprocess.CREATE_NO_WINDOW)
+        record.update(exit_code=result.returncode, stdout=result.stdout.decode("utf-8", errors="replace"),
+                      stderr=result.stderr.decode("utf-8", errors="replace"),
+                      cleanup="owned harness child exited and was reaped")
+    except subprocess.TimeoutExpired as error:
+        record.update(exit_code=124, stdout=(error.stdout or b"").decode("utf-8", errors="replace"),
+                      stderr=(error.stderr or b"").decode("utf-8", errors="replace"),
+                      error="Timeout: input may already have occurred; inspect and do not replay.",
+                      cleanup="owned harness child terminated and reaped")
+    record["finished_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    with receipt.open("x", encoding="utf-8") as stream:
+        json.dump(record, stream, ensure_ascii=False, indent=2)
+    print(json.dumps({"receipt": str(receipt), **record}, ensure_ascii=True))
+    return record["exit_code"]
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+'@ '0b4426636e121d9bdd8e560f32d120a8e9ebefdf4e3863030e873986164264bd'
+    Write-PublicFile 'PERMISSION.txt' @'
+I authorize a bounded Windows desktop diagnostic using this Python harness: status and window discovery, launching one disposable test fixture, inspecting screenshots, and testing pointer movement, one button click, Unicode text, Ctrl+A, one wheel notch, and normal closure only in that fixture. Use the host's supported execution approval process, including a scoped require_escalated request if needed and permitted. Preserve and report denials; stop if review rejects an action. Do not control other applications, send messages, alter settings/security, use another identity, copy host metadata, or bypass approvals. Inspect after each action and never blindly replay uncertain input.
+'@ '6593f9b6a51766298c34d3711718a3c90056b311b61b2086f1845464c51f058a'
+    Write-PublicFile 'README.md' @'
+# Windows Python control: runnable paste kit
+
+The setup paste block writes the reviewed stdlib Python harness, fixture and original tests into a new folder. It performs no desktop action, downloads nothing, changes no settings, and refuses to reuse a destination. The four original Python files are copied unchanged. `selftest.py` and `run_control.py` are small new packaging helpers; they do not replace the input backend.
+
+Use Windows Python 3 with no additional packages for the backend. The optional fixture also needs tkinter/Tk. The prior functional checks used 64-bit Python 3.12. Keep this kit outside generated runtime/plugin caches. It is a fallback backend, not a repair for missing official native/MCP tools.
+
+## Setup
+
+Open `setup-windows-control.ps1`, review it, and paste the complete contents into an authorized PowerShell session in a writable working directory. It creates a new `windows-python-control-*` directory and prints its location. It does not launch the harness or fixture. If an execution policy blocks running the saved `.ps1` as a file, do not change policy or use a bypass switch.
+
+The separately supplied folder already contains the same runnable files; no setup script is required when those files have been copied together.
+
+## Permission to paste into the agent
+
+> I authorize a bounded Windows desktop diagnostic using this Python harness: status and window discovery, launching one disposable test fixture, inspecting screenshots, and testing pointer movement, one button click, Unicode text, Ctrl+A, one wheel notch, and normal closure only in that fixture. Use the host's supported execution approval process, including a scoped require_escalated request if needed and permitted. Preserve and report denials; stop if review rejects an action. Do not control other applications, send messages, alter settings/security, use another identity, copy host metadata, or bypass approvals. Inspect after each action and never blindly replay uncertain input.
+
+This text supplies task scope; it does not override host policy or confer Windows administrator rights. It does not authorize terminal/assistant UI messaging or arbitrary application control.
+
+## Self-test: no desktop query or input
+
+In the kit folder, set the real path to your Windows Python interpreter:
+
+```powershell
+$pythonControl = 'C:\PATH\TO\python.exe'
+& $pythonControl -X utf8 .\selftest.py
+```
+
+Expected: 17 cases considered, 16 pass, one skip. The skipped original `test_status_protocol` reads the desktop; the self-test deliberately blocks Desktop construction, WinDLL loading and child launches. It parses all Python files and runs the original ABI, Unicode, PNG, receipt and refusal checks. This does not constitute a new GUI acceptance test.
+
+## Read-only status and discovery, when authorized
+
+```powershell
+& $pythonControl -X utf8 .\run_control.py status
+& $pythonControl -X utf8 .\run_control.py windows
+```
+
+Run separately and inspect each result. `run_control.py` bounds the unchanged harness command to eight seconds and saves a receipt. It performs no retries or elevation. Status/window outputs contain local identifiers: keep them private. An accepted status call is not proof of input acceptance.
+
+If a call fails, preserve the failing API, error and execution context. Do not continue into input. The previously observed default status failure was GetCursorPos / WinError 5. After explicit user authorization, normal review accepted a tool-level `require_escalated` request; the same Python, harness, status arguments and working directory passed with no environment overrides. The Windows administrator-token state and exact access-check cause were not measured.
+
+## Exact host execution-call distinction
+
+These are examples for a host that actually exposes this `tools.exec_command` schema. Replace the generic paths. They are separate requests, not an automatic retry script. `use_default` is also the documented default when the field is omitted:
+
+```javascript
+const result = await tools.exec_command({
+  cmd: "& 'C:/PATH/TO/python.exe' -X utf8 'C:/PATH/TO/kit/run_control.py' status",
+  workdir: "C:/PATH/TO/authorized-workspace",
+  sandbox_permissions: "use_default"
+});
+```
+
+Only when current user scope and host policy permit a supported approval request:
+
+```javascript
+const result = await tools.exec_command({
+  cmd: "& 'C:/PATH/TO/python.exe' -X utf8 'C:/PATH/TO/kit/run_control.py' status",
+  workdir: "C:/PATH/TO/authorized-workspace",
+  sandbox_permissions: "require_escalated",
+  justification: "Run the user-authorized bounded fixture diagnostic."
+});
+```
+
+`require_escalated` is a host tool argument, not a Python flag, PowerShell switch or Windows administrator-token guarantee. The host may reject it. Keep the real review result; stop if rejected. Do not disable sandboxing/UAC, alter ACLs, use RunAs/another identity, copy credentials or host request metadata, or remove enforcement flags. No custom approval rules are needed or included.
+
+## Start only the disposable fixture
+
+After authorization and successful access checks, use a separate PowerShell session in the kit directory. This command intentionally opens one visible fixture and runs until it closes:
+
+```powershell
+$pythonControl = 'C:\PATH\TO\python.exe'
+& $pythonControl -X utf8 .\test_window.py --out .\fixture-run-001
+```
+
+Use a new fixture directory. The fixture writes its PID/HWND and accepted event state to `fixture.json`, and closes after ten minutes or normal window closure. Discover its current window and match ownership; never use a historical PID/HWND. The kit does not automatically launch it or control any real application.
+
+## One action at a time
+
+Set values from current discovery and the inspected screenshot, never from an example. The following command templates are separate stages:
+
+```powershell
+$targetHwnd = [long](Read-Host 'Current owned fixture HWND')
+$targetProcessId = [int](Read-Host 'Current owned fixture PID')
+& $pythonControl -X utf8 .\run_control.py observe --hwnd $targetHwnd --pid $targetProcessId --out .\evidence\before
+```
+
+Open and inspect `evidence/before.png` before deciding any input. Then, for one currently authorized action:
+
+```powershell
+$pointX = [int](Read-Host 'Verified screenshot-relative x')
+$pointY = [int](Read-Host 'Verified screenshot-relative y')
+& $pythonControl -X utf8 .\run_control.py act --observation .\evidence\before.json --kind click --x $pointX --y $pointY --out .\evidence\after-click
+```
+
+Inspect `after-click.png`. Set `$observation` to the latest inspected JSON, `$nextOut` to a new output prefix, and `$textFile` to an exact UTF-8 text file without a BOM or trailing newline. Run only one of these templates at a time, refreshing those variables after inspection:
+
+```powershell
+& $pythonControl -X utf8 .\run_control.py act --observation $observation --kind move --x $pointX --y $pointY --out $nextOut
+& $pythonControl -X utf8 .\run_control.py act --observation $observation --kind text --text-file $textFile --out $nextOut
+& $pythonControl -X utf8 .\run_control.py act --observation $observation --kind key --key CTRL+A --out $nextOut
+& $pythonControl -X utf8 .\run_control.py act --observation $observation --kind scroll --x $pointX --y $pointY --delta 120 --out $nextOut
+```
+
+Text uses UTF-16 code-unit key-down/up pairs, including surrogate pairs for emoji; no clipboard is involved. The range is 1–1,000 characters; control keys are separate. Supported actions also include normal `activate`, left/right/middle clicks, and named keys. Normal foreground activation can fail: do not force it. Any input may change state before an error or timeout is reported; inspect rather than replay.
+
+The harness requires a fresh observation (at most 120 seconds), current HWND/PID, unchanged title/class/rectangle, visible target, pointer-point ownership, and foreground focus for keyboard/wheel input. It checks held buttons/modifiers and SendInput counts. These guards cannot prevent every race with human input; stop when the user types or the draft/focus changes unexpectedly.
+
+## Verify and close only the fixture
+
+Require inspected screenshots plus fixture state: pointer location matches, clicks=1, exact Unicode text/code points match, Ctrl+A visibly selects all text, and wheel_total=120. Use fresh observations for each stage. The previously tested Unicode included U+03A9, U+6F22 and U+1F600.
+
+After verifying the owned fixture is foreground, normal closure is one action:
+
+```powershell
+& $pythonControl -X utf8 .\run_control.py act --observation $observation --kind key --key ALT+F4 --out $nextOut
+```
+
+Inspect `fixture.json` for `closed=true` and verify the fixture command exited normally. `post_observation_failed: Window no longer exists` after closing can be expected; never repeat the close blindly. Do not kill user processes. For programmatic launching, retain the actual child handle and clean up only that child; a timeout cannot undo inserted events.
+
+## Limits and evidence
+
+Capture is a visible desktop crop using BitBlt/GetDIBits; overlapping apps, protected surfaces and accelerated rendering may prevent useful captures. Stop at a wrong/black/obscured image. Negative virtual origins are handled. Mixed-DPI layouts need separate validation: requesting PMv2 and using GetSystemMetrics is not universal DPI certification. The existing DPI-awareness call's return is not validated. There is no OCR, accessibility tree, browser DOM, drag, app launcher, background control or global emergency hotkey.
+
+Prior bounded acceptance covered the fixture and two separately authorized terminal messages. Those historical results do not authorize new messaging and do not restore native registration, a CLI queue API or an automatic Slack listener. This packaging run performs no GUI acceptance test.
+
+API references: [SendInput](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-sendinput), [GetCursorPos](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getcursorpos), [GetDIBits](https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-getdibits), [GetSystemMetrics](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getsystemmetrics).
+
+The harness needs no service, plugin or persistent worker. Stop invoking it to stop control. Public source excludes private screenshots, evidence archives, identifiers, paths and custom rules; newly generated local receipts can contain private information and must be reviewed before sharing.
+'@ 'bbaa6a9ae6d69258cb6a9dd519082ce18f9fff37f9b7947b30d0d7fdf0de6f39'
+    [pscustomobject]@{ KitDirectory = $kitDirectory; FileCount = 8; DesktopCodeExecuted = $false } | ConvertTo-Json
+}
