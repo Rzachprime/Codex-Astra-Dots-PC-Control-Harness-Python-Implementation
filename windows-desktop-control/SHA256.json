@@ -1,0 +1,34 @@
+{
+  "win_control.py": {
+    "bytes": 20622,
+    "sha256": "419475dba659cd718ed0abc9958e964998d7005f7b77f295c5cadbcc05013cf8"
+  },
+  "test_window.py": {
+    "bytes": 2514,
+    "sha256": "71de9195983f1d26feee36edda08e513d3f467f74e5e805c56d357ad04ff323e"
+  },
+  "test_core.py": {
+    "bytes": 2768,
+    "sha256": "e77eb3d7daa047cd0200c5fd4236e6171293b65549523a8f7916daa1296fbbbe"
+  },
+  "test_guards.py": {
+    "bytes": 3239,
+    "sha256": "530793b8b3d7470d07c8b67fa0a805c31efe5b32db87abc8c8ef69dd6274517a"
+  },
+  "selftest.py": {
+    "bytes": 1535,
+    "sha256": "5b9ec2a0f5f1916acaf18d36e0ff53c5493e6cd54bf140d31aa20de306278723"
+  },
+  "run_control.py": {
+    "bytes": 2106,
+    "sha256": "0b4426636e121d9bdd8e560f32d120a8e9ebefdf4e3863030e873986164264bd"
+  },
+  "PERMISSION.txt": {
+    "bytes": 688,
+    "sha256": "6593f9b6a51766298c34d3711718a3c90056b311b61b2086f1845464c51f058a"
+  },
+  "README.md": {
+    "bytes": 10507,
+    "sha256": "bbaa6a9ae6d69258cb6a9dd519082ce18f9fff37f9b7947b30d0d7fdf0de6f39"
+  }
+}
